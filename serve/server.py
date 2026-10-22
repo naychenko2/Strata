@@ -1020,6 +1020,9 @@ class StrataEngine:
             pin["preexec_fn"] = lambda: (say_nice() if say_nice else None, os.nice(nice))[0]
             print(f"[strata] engine priority: nice +{nice} (this PC has built-in Radeon graphics that usually draw the desktop; "
                   "STRATA_ENGINE_NICE=0 turns it off)", flush=True)
+        # --conversation-disk-persist on|exit-only: at QUIT the engine first writes its conversations to the disk (GBs)
+        persist = args[args.index("--conversation-disk-persist") + 1] if "--conversation-disk-persist" in args else "off"
+        self.quit_s = ENGINE_QUIT_WAIT_S if persist == "off" else 300
         end_leftover_engines(exe)                        # one an earlier run lost still holds the GPU and the memory
         spawned_at = time.monotonic()
         try:
@@ -2449,7 +2452,7 @@ class StrataEngine:
                     self.proc.stdin.write("STOP\nQUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
-                    self.proc.wait(timeout=ENGINE_QUIT_WAIT_S)
+                    self.proc.wait(timeout=getattr(self, "quit_s", ENGINE_QUIT_WAIT_S))
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     self.proc.terminate()
                     self.proc.wait(timeout=ENGINE_TERM_WAIT_S)
