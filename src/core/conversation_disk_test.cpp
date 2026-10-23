@@ -122,10 +122,12 @@ void touch(const fs::path& p) { std::ofstream(p, std::ios::binary) << "x"; }
 
 std::vector<std::string> lines;   // the tier's diagnostic lines
 std::mutex lines_m;
-ConversationDiskOptions opts(const fs::path& dir, uint64_t budget) {
+// deltas = 0: без цепочек (take() убирает запись) - так проверено всё, что было до цепочек
+ConversationDiskOptions opts(const fs::path& dir, uint64_t budget, size_t deltas = 0) {
     ConversationDiskOptions o;
     o.dir = dir.string();
     o.budget_bytes = budget;
+    o.max_deltas = deltas;
     o.log = [](const std::string& l) { std::lock_guard<std::mutex> g(lines_m); lines.push_back(l); };
     return o;
 }
@@ -133,6 +135,75 @@ bool logged(const char* what) {
     std::lock_guard<std::mutex> g(lines_m);
     for (const auto& l : lines) if (l.find(what) != std::string::npos) return true;
     return false;
+}
+
+// Цепочки: маленький блок, чтобы дельта была видна на образах в десятки МиБ.
+ConversationDiskOptions chain_opts(const fs::path& dir, uint64_t budget, size_t deltas = 8) {
+    auto o = opts(dir, budget, deltas);
+    o.delta_block_bytes = 4096;
+    return o;
+}
+
+// Следующий ход той же беседы: +add токенов, новое running state, контрольная точка там, где был конец, K/V каждого
+// слоя длиннее на kv_add байт (начало не меняется) - в каждой стадии.
+SavedConversation turn(const SavedConversation& prev, size_t add, uint8_t seed, size_t kv_add = 3000) {
+    SavedConversation s = prev;
+    auto step = [&](SavedConversation& x, uint8_t sd) {
+        ConversationCheckpoint ck = checkpoint(0, uint8_t(sd + 100));
+        ck.ids = x.live.ids;
+        ck.imgs = x.live.imgs;
+        x.checkpoints.insert(x.checkpoints.begin(), std::move(ck));   // самая глубокая - первой
+        const int32_t next = x.live.ids.empty() ? 1000 : x.live.ids.back() + 1;
+        for (size_t i = 0; i < add; ++i) x.live.ids.push_back(next + int32_t(i));
+        x.live.gdn = bytes_of(x.live.gdn.size(), sd);
+        x.live.ple = bytes_of(x.live.ple.size(), uint8_t(sd + 1));
+        x.live.tails = bytes_of(x.live.tails.size(), uint8_t(sd + 2));
+        x.live.used += 1;
+        for (auto& kv : x.kv)
+            for (ConversationBuffer* b : {&kv.k, &kv.v}) {
+                const size_t was = b->size();
+                b->resize(was + kv_add);
+                b->visit(was, kv_add, [&](uint8_t* p, size_t c, size_t at) {
+                    for (size_t i = 0; i < c; ++i) p[i] = uint8_t((at + i) * 17u + sd);
+                    return true;
+                });
+            }
+    };
+    step(s, seed);
+    for (auto& st : s.stage_images) step(st, uint8_t(seed + 50));
+    return s;
+}
+
+std::string file_bytes(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+// Байт в байт: каждая стадия обоих образов - в сессионный файл, файлы равны.
+bool same_files(const SavedConversation& a, const SavedConversation& b, const fs::path& dir) {
+    if (a.stage_images.size() != b.stage_images.size()) return false;
+    for (size_t k = 0; k <= a.stage_images.size(); ++k) {
+        const SavedConversation& x = k ? a.stage_images[k - 1] : a;
+        const SavedConversation& y = k ? b.stage_images[k - 1] : b;
+        size_t n = 0;
+        std::string e;
+        const fs::path fx = dir / "same-a.ses", fy = dir / "same-b.ses";
+        if (!session_file_write(fx.string(), x, {1, 2}, n, e) || !session_file_write(fy.string(), y, {1, 2}, n, e))
+            return false;
+        const bool eq = file_bytes(fx) == file_bytes(fy);
+        fs::remove(fx);
+        fs::remove(fy);
+        if (!eq) return false;
+    }
+    return true;
+}
+
+std::vector<fs::path> deltas_in(const fs::path& dir) {
+    std::vector<fs::path> v;
+    for (const auto& f : fs::directory_iterator(dir))
+        if (f.path().filename().string().find("-delta.bin") != std::string::npos) v.push_back(f.path());
+    std::sort(v.begin(), v.end());
+    return v;
 }
 }  // namespace
 
@@ -327,6 +398,225 @@ int main() {
                   "persist: a's image under b's index is refused, never restored as b");
             check(tier.best(prompt_of(450), {}, false).tokens == 400, "persist: a is still there");
         }
+    }
+
+    for (const auto& f : fs::directory_iterator(dir)) fs::remove_all(f.path());
+
+    // ---- цепочки: база + дельты
+
+    {   // дельта пишется и читается; цепочка собирается в тот же образ, что запись целиком (байт в байт)
+        ConversationDiskTier tier(chain_opts(dir, GiB));
+        check(tier.open(e) && tier.enabled(), "chain: open");
+        const SavedConversation t0 = split_image(600, 1);
+        check(tier.put(split_image(600, 1)), "chain: put the base");
+        tier.wait_idle();
+        const auto m0 = tier.best(prompt_of(700), {}, false);
+        SavedConversation back;
+        check(tier.take(m0.id, m0.tokens, back, e) && same(back, t0), "chain: the base back");
+        check(tier.size() == 1 && tier_files(dir) == 2, "chain: a read keeps the entry and its files (the delta's base)");
+        const SavedConversation t1 = turn(t0, 50, 2);
+        check(tier.put(turn(t0, 50, 2)), "chain: put the next turn");
+        tier.wait_idle();
+        auto st = tier.stats();
+        check(st.written == 2 && st.deltas == 1 && tier.size() == 1 && tier_files(dir) == 3,
+              "chain: the next turn is one delta file beside the base");
+        check(logged("wrote delta 650 tokens (+50 tokens"), "chain: the delta is logged");
+        check(st.delta_bytes > 0 && st.delta_bytes * 50 < st.delta_image_bytes,
+              "chain: the delta is a small part of the image");
+        check(tier.bytes() > st.delta_bytes && tier.bytes() == st.bytes_written, "chain: the budget counts the chain");
+        check(tier.best(prompt_of(640), {}, false).tokens == 600, "chain: the turn's checkpoint matches");
+        const auto m1 = tier.best(prompt_of(800), {}, false);
+        check(m1.tokens == 650 && m1.live && m1.id != m0.id, "chain: the new state matches, under a new id");
+        back = SavedConversation{};
+        check(tier.take(m1.id, m1.tokens, back, e), "chain: take the base and its delta");
+        check(same(back, t1), "chain: assembled exactly");
+        check(same_files(back, t1, dir), "chain: byte for byte the session files of the whole image");
+        check(logged("(a base and 1 delta)"), "chain: the hit names its delta");
+        const SavedConversation t2 = turn(t1, 40, 3);
+        check(tier.put(turn(t1, 40, 3)), "chain: put a third turn");
+        tier.wait_idle();
+        check(tier.stats().deltas == 2 && tier_files(dir) == 4, "chain: a second delta");
+        const auto m2 = tier.best(prompt_of(800), {}, false);
+        back = SavedConversation{};
+        check(m2.tokens == 690 && tier.take(m2.id, m2.tokens, back, e) && same(back, t2) && same_files(back, t2, dir),
+              "chain: a base and two deltas, byte for byte");
+        check(logged("totals:") && logged("as deltas:"), "chain: the totals count the deltas");
+    }
+    check(tier_files(dir) == 0, "chain: the tier removes its chains when it ends");
+
+    {   // уплотнение по числу дельт: третья запись при пределе 2 переписывает цепочку целиком
+        ConversationDiskTier tier(chain_opts(dir, GiB, 2));
+        check(tier.open(e), "compaction: open");
+        SavedConversation t = image(600, 5);
+        check(tier.put(SavedConversation(t)), "compaction: base");
+        for (int i = 0; i < 3; ++i) {
+            t = turn(t, 30, uint8_t(10 + i));
+            check(tier.put(SavedConversation(t)), "compaction: a turn");
+            tier.wait_idle();
+        }
+        const auto st = tier.stats();
+        check(st.deltas == 2 && st.compactions == 1 && tier.size() == 1 && tier_files(dir) == 1,
+              "compaction: two deltas, then the chain is one whole image again");
+        check(logged("compaction: replaces its chain of 660 tokens and 2 deltas (the chain holds 2 deltas)"),
+              "compaction: logged with its reason");
+        const auto m = tier.best(prompt_of(800), {}, false);
+        SavedConversation back;
+        check(m.tokens == 690 && tier.take(m.id, m.tokens, back, e) && same(back, t), "compaction: the image back");
+        // уплотнение по объёму: ход, переписавший весь K/V (и длиннее его), тяжелее базы
+        const SavedConversation heavy = turn(image(700, 77), 0, 78, 200000);
+        check(tier.put(SavedConversation(heavy)), "compaction: a turn that rewrites everything");
+        tier.wait_idle();
+        check(tier.stats().compactions == 2 && tier.stats().deltas == 2 && logged("would outweigh the base"),
+              "compaction: deltas heavier than the base are not written");
+        const auto h = tier.best(prompt_of(800), {}, false);
+        back = SavedConversation{};
+        check(h.tokens == 700 && tier.take(h.id, h.tokens, back, e) && same(back, heavy) && tier_files(dir) == 1,
+              "compaction: the heavy turn whole, the old chain gone");
+    }
+
+    {   // вытеснение - цепочкой целиком; своя дельта свою базу не вытесняет
+        ConversationDiskTier tier(chain_opts(dir, 25ull << 20));   // одна ~17 MiB цепочка, не две
+        check(tier.open(e), "chain eviction: open");
+        const SavedConversation a0 = image(400, 30);
+        check(tier.put(SavedConversation(a0)), "chain eviction: a");
+        check(tier.put(turn(a0, 20, 31)), "chain eviction: a's next turn");
+        tier.wait_idle();
+        check(tier.size() == 1 && tier.stats().deltas == 1 && tier.stats().evicted == 0 && tier_files(dir) == 2,
+              "chain eviction: the delta fits beside its base");
+        check(tier.put(image(400, 32, 5000)), "chain eviction: b");
+        tier.wait_idle();
+        check(tier.size() == 1 && tier.stats().evicted == 1 && tier_files(dir) == 1 && deltas_in(dir).empty(),
+              "chain eviction: b evicts a's base and delta together");
+        check(tier.best(prompt_of(500), {}, false).tokens == 0 && tier.best(prompt_of(500, 5000), {}, false).tokens == 400,
+              "chain eviction: a is gone, b stays");
+    }
+
+    {   // битая дельта: take() не удался, цепочка откатилась на базу, база читается
+        ConversationDiskTier tier(chain_opts(dir, GiB));
+        check(tier.open(e), "cut: open");
+        const SavedConversation t0 = split_image(600, 40);
+        check(tier.put(SavedConversation(t0)) && tier.put(turn(t0, 50, 41)), "cut: a base and a delta");
+        tier.wait_idle();
+        const auto d = deltas_in(dir);
+        check(d.size() == 1 && tier.stats().deltas == 1, "cut: one delta file");
+        {
+            std::fstream f(d[0], std::ios::binary | std::ios::in | std::ios::out);
+            f.seekp((std::streamoff) fs::file_size(d[0]) / 2);
+            const char x = 0x5a;
+            f.write(&x, 1);
+        }
+        const auto m = tier.best(prompt_of(800), {}, false);
+        SavedConversation back;
+        check(m.tokens == 650 && !tier.take(m.id, m.tokens, back, e) && back.kv.empty(), "cut: the damaged chain fails");
+        check(logged("is damaged") && logged("cut back to its base of 600 tokens (1 delta removed)"), "cut: logged");
+        const auto st = tier.stats();
+        check(st.chain_cuts == 1 && st.read_failed == 1 && tier.size() == 1 && tier_files(dir) == 2 &&
+              deltas_in(dir).empty(), "cut: the delta is gone, the base stays");
+        const auto b = tier.best(prompt_of(800), {}, false);
+        check(b.tokens == 600 && b.live && b.id != m.id, "cut: the base matches again");
+        check(tier.take(b.id, b.tokens, back, e) && same(back, t0), "cut: the base is read back");
+    }
+
+    {   // чужая дельта (цела, но от другой цепочки): по сцепке отпечатков - откат на базу
+        ConversationDiskTier tier(chain_opts(dir, GiB));
+        check(tier.open(e), "foreign: open");
+        const SavedConversation a0 = image(600, 45);
+        check(tier.put(SavedConversation(a0)) && tier.put(turn(a0, 50, 46)), "foreign: chain a");
+        tier.wait_idle();
+        const auto da = deltas_in(dir);
+        const SavedConversation u0 = image(500, 47, 7000);
+        check(tier.put(SavedConversation(u0)) && tier.put(turn(u0, 10, 48)), "foreign: chain u");
+        tier.wait_idle();
+        auto du = deltas_in(dir);
+        du.erase(std::remove(du.begin(), du.end(), da.at(0)), du.end());
+        check(da.size() == 1 && du.size() == 1 && tier.stats().deltas == 2, "foreign: two chains with a delta each");
+        fs::copy_file(du[0], da[0], fs::copy_options::overwrite_existing);   // дельта u на месте дельты a
+        const auto m = tier.best(prompt_of(800), {}, false);
+        SavedConversation back;
+        check(m.tokens == 650 && !tier.take(m.id, m.tokens, back, e) && logged("a foreign delta"),
+              "foreign: refused by its link");
+        check(tier.stats().chain_cuts == 1 && tier.best(prompt_of(800), {}, false).tokens == 600,
+              "foreign: chain a is back at its base");
+        const auto mu = tier.best(prompt_of(600, 7000), {}, false);
+        check(mu.tokens == 510 && tier.take(mu.id, mu.tokens, back, e) && same(back, turn(u0, 10, 48)),
+              "foreign: chain u is untouched");
+    }
+
+    {   // persist: цепочка переживает рестарт и растёт дальше; движок без цепочек видит базу
+        auto persistent = [&](size_t deltas) {
+            auto o = chain_opts(dir, GiB, deltas);
+            o.persist = true;
+            o.identity = {9, 7};
+            return o;
+        };
+        const SavedConversation t0 = split_image(600, 60);
+        const SavedConversation t1 = turn(t0, 50, 61);
+        const SavedConversation t2 = turn(t1, 40, 62);
+        {
+            ConversationDiskTier tier(persistent(8));
+            check(tier.open(e) && tier.put(SavedConversation(t0)) && tier.put(SavedConversation(t1)),
+                  "chain persist: a base and a delta");
+        }
+        check(tier_files(dir) == 5 && deltas_in(dir).size() == 1, "chain persist: 2 images, a delta, index and list kept");
+        {
+            ConversationDiskTier tier(persistent(8));
+            check(tier.open(e) && tier.size() == 1 && logged("1 with deltas"), "chain persist: taken in as a chain");
+            const auto m = tier.best(prompt_of(800), {}, false);
+            SavedConversation back;
+            check(m.tokens == 650 && tier.take(m.id, m.tokens, back, e) && same(back, t1),
+                  "chain persist: the chain read back after a restart");
+            check(tier.put(SavedConversation(t2)), "chain persist: the next turn");
+            tier.wait_idle();
+            check(tier.stats().deltas == 1 && deltas_in(dir).size() == 2,
+                  "chain persist: the field table outlived the restart: a delta again");
+        }
+        {
+            ConversationDiskTier tier(persistent(8));
+            check(tier.open(e) && tier.size() == 1, "chain persist: a second restart");
+            const auto m = tier.best(prompt_of(800), {}, false);
+            SavedConversation back;
+            check(m.tokens == 690 && tier.take(m.id, m.tokens, back, e) && same(back, t2) && same_files(back, t2, dir),
+                  "chain persist: a base and two deltas after two restarts, byte for byte");
+        }
+        {   // откат на движок без цепочек: индекс v1 описывает базу - она поднимается, дельты уходят
+            ConversationDiskTier tier(persistent(0));
+            check(tier.open(e) && tier.size() == 1 && deltas_in(dir).empty() && tier_files(dir) == 3,
+                  "chain persist: without chains the base is taken in, the deltas and the list removed");
+            const auto m = tier.best(prompt_of(800), {}, false);
+            SavedConversation back;
+            check(m.tokens == 600 && tier.take(m.id, m.tokens, back, e) && same(back, t0),
+                  "chain persist: the base read back by a tier without chains");
+        }
+        check(tier_files(dir) == 0, "chain persist: taken without chains: gone");
+        {   // файлы без цепочек (как их писал прежний движок) читаются базой без дельт; следующий ход - целиком
+            {
+                ConversationDiskTier tier(persistent(0));
+                check(tier.open(e) && tier.put(SavedConversation(t0)), "old files: written without chains");
+            }
+            ConversationDiskTier tier(persistent(8));
+            check(tier.open(e) && tier.size() == 1, "old files: taken in");
+            const auto m = tier.best(prompt_of(800), {}, false);
+            SavedConversation back;
+            check(m.tokens == 600 && tier.take(m.id, m.tokens, back, e) && same(back, t0), "old files: read back");
+            check(tier.put(SavedConversation(t1)), "old files: the next turn");
+            tier.wait_idle();
+            check(tier.stats().deltas == 0 && logged("(the copy on the disk has no field table)") && tier.size() == 1,
+                  "old files: the next turn replaces the old copy whole");
+            check(tier.put(SavedConversation(t2)), "old files: one more turn");
+            tier.wait_idle();
+            check(tier.stats().deltas == 1, "old files: from then on deltas");
+        }
+    }
+
+    {   // RAM не хватило на чтение: с цепочками запись остаётся на диске
+        ConversationDiskTier tier(chain_opts(dir, GiB));
+        check(tier.open(e) && tier.put(image(400, 70)), "chain refused read: put");
+        tier.wait_idle();
+        const auto m = tier.best(prompt_of(450), {}, false);
+        SavedConversation back;
+        check(!tier.take(m.id, m.tokens, back, e, [](uint64_t, std::string& why) { why = "no RAM"; return false; }) &&
+              tier.size() == 1 && tier_files(dir) == 1 && logged("the entry stays on the disk"),
+              "chain refused read: the entry stays");
     }
 
     fs::remove_all(dir);

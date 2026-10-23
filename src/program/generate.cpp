@@ -734,6 +734,9 @@ struct Options {
     /// is written to this folder instead of dropped, and read back when a request continues it.  Empty = off.
     std::string conversation_disk_dir;
     int64_t conversation_disk_mib = 32768;    ///< --conversation-disk-mib: at most this many MiB of files
+    /// --conversation-disk-deltas: беседа, вернувшаяся на диск, пишется дельтой к своему прошлому состоянию, не более
+    /// стольких дельт на цепочку; 0 = каждая запись целиком (как до цепочек)
+    int64_t conversation_disk_deltas = 8;
     /// --conversation-disk-persist: off = the files end with the engine; on = they outlive it and QUIT writes the
     /// current and the parked conversations; exit-only = the same, but nothing is written while the engine runs
     std::string conversation_disk_persist = "off";
@@ -899,6 +902,9 @@ void usage() {
                  "  --conversation-disk-dir DIR  --serve: a conversation the RAM cache evicts is written to DIR and read\n"
                  "                       back when a request continues it (needs --conversation-cache-mib; default off)\n"
                  "  --conversation-disk-mib N  --serve: at most N MiB of such files (default 32768)\n"
+                 "  --conversation-disk-deltas N  --serve: a conversation that comes back to the disk is written as a\n"
+                 "                       delta to its copy there (the changed blocks only), up to N deltas before the\n"
+                 "                       whole image is written again (default 8; 0 = every write whole)\n"
                  "  --conversation-disk-persist off|on|exit-only  --serve: keep the disk's conversations for the next start:\n"
                  "                       off (default) removes them at the end; on keeps them and QUIT writes the\n"
                  "                       current and the parked ones there first; exit-only writes at QUIT alone,\n"
@@ -2643,12 +2649,13 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
                  a == "--conversation-cache-park-gain" ||
-                 a == "--session-min-free-mib" || a == "--memory-limit-mib" || a == "--conversation-disk-mib") {
+                 a == "--session-min-free-mib" || a == "--memory-limit-mib" || a == "--conversation-disk-mib" ||
+                 a == "--conversation-disk-deltas") {
             const std::string value = next(a.c_str());
             int64_t number = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
             const int64_t limit = (a == "--conversation-cache-slots" || a == "--conversation-cache-min-tokens" ||
-                                   a == "--conversation-cache-park-gain")
+                                   a == "--conversation-cache-park-gain" || a == "--conversation-disk-deltas")
                                       ? INT32_MAX : INT64_MAX / (1024 * 1024);
             if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 || number > limit) {
                 std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
@@ -2661,6 +2668,7 @@ int main(int argc, char** argv) {
             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
             else if (a == "--conversation-disk-mib") o.conversation_disk_mib = number;
+            else if (a == "--conversation-disk-deltas") o.conversation_disk_deltas = number;
             else o.conversation_cache_slots = (int) number;
         }
         else if (a == "--conversation-disk-dir") o.conversation_disk_dir = next("--conversation-disk-dir");
@@ -9351,6 +9359,7 @@ int main(int argc, char** argv) {
         disk_opts.dir = conversations.enabled() ? o.conversation_disk_dir : std::string();
         disk_opts.budget_bytes = (uint64_t) o.conversation_disk_mib << 20;
         disk_opts.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+        disk_opts.max_deltas = (size_t) o.conversation_disk_deltas;
         if (o.conversation_disk_persist != "off" && !disk_opts.dir.empty()) {
             // the session files' identity: a later start with the same model and settings takes the files in
             std::string id_err;
@@ -12636,14 +12645,25 @@ int main(int argc, char** argv) {
                     strata::core::SavedConversation image;
                     std::string disk_err;
                     const auto d0 = Clock::now();
-                    if (conv_disk.take(on_disk.id, on_disk.tokens, image, disk_err, admit)) {
-                        disk_read_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
-                        incoming.emplace(std::move(image));
-                        parked.tokens = on_disk.tokens;
-                        parked.live = on_disk.live;
-                    } else {
-                        std::fprintf(stderr, "strata serve: conversation disk: %lld tokens not restored (%s); reading "
-                                             "the prompt\n", (long long) on_disk.tokens, disk_err.c_str());
+                    const size_t cuts = ds.chain_cuts;
+                    auto match = on_disk;
+                    for (int attempt = 0; attempt < 2; ++attempt) {
+                        if (conv_disk.take(match.id, match.tokens, image, disk_err, admit)) {
+                            disk_read_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
+                            incoming.emplace(std::move(image));
+                            parked.tokens = match.tokens;
+                            parked.live = match.live;
+                            break;
+                        }
+                        // битая дельта откатила цепочку на базу: база может держать часть этого запроса
+                        const bool cut = attempt == 0 && conv_disk.stats().chain_cuts != cuts;
+                        if (cut) match = conv_disk.best(ids, req_imgs, want_cvec);
+                        const bool retry = cut && match.tokens > reused_without_disk;
+                        std::fprintf(stderr, "strata serve: conversation disk: %lld tokens not restored (%s); %s\n",
+                                     (long long) (attempt == 0 ? on_disk.tokens : match.tokens), disk_err.c_str(),
+                                     retry ? "trying the chain's base" : "reading the prompt");
+                        if (!retry) break;
+                        disk_err.clear();
                     }
                     if (evicted && !incoming) parked = conversations.best(ids, req_imgs, want_cvec);   // indices moved
                 }

@@ -4,6 +4,12 @@
 // By default only this process reads its files back, and the folder's files of this tier are removed at start and at
 // the end.  `persist`: the files are bound to the session files' identity (model and settings) instead, a small index
 // file beside each conversation lists its tokens, and the next start picks them up (no time limit, the budget only).
+//
+// Цепочки (max_deltas > 0): беседа, которая вернулась на диск, пока там лежит её прошлое состояние (взятое take()
+// или вытесненное ранее), пишется не целиком, а дельтой к нему: только блоки полей образа, чьи хеши изменились
+// (хвост K/V, свежее running state, новые контрольные точки).  База - прежние сессионные файлы и индекс v1 ровно
+// как без цепочек (старый движок видит базу), дельты и их опись - в файле-спутнике .chn.  Цепочка вытесняется и
+// уплотняется (переписывается целиком) как одно целое.  Формат - в DELTA.md рядом с исходниками.
 #pragma once
 
 #include "strata/core/conversation_cache.hpp"
@@ -14,7 +20,10 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
+#include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -32,6 +41,11 @@ struct ConversationDiskOptions {
     std::function<void(const std::string&)> log;
     /// Tests: called on the writer thread before each write starts.
     std::function<void()> before_write;
+    /// --conversation-disk-deltas: сколько дельт держит цепочка, прежде чем следующая запись перепишет образ целиком;
+    /// 0 - без цепочек: каждая запись целиком, take() убирает запись с диска (поведение до цепочек).
+    size_t max_deltas = 8;
+    /// Размер блока, которым дельта сравнивает поля образа (байт); тесты берут маленький.
+    uint64_t delta_block_bytes = 256u << 10;
 };
 
 /// What the tier did since it started (diagnostics).
@@ -41,6 +55,11 @@ struct ConversationDiskStats {
     uint64_t bytes_written = 0, bytes_read = 0;
     uint64_t tokens_back = 0;                 ///< prompt tokens given back (not read again) by ram or disk hits
     double write_ms = 0, read_ms = 0, wait_ms = 0;
+    size_t deltas = 0;              ///< записей дельтой (входят в written)
+    size_t compactions = 0;         ///< цепочек, переписанных целиком по пределу дельт или их объёма
+    size_t chain_cuts = 0;          ///< цепочек, откаченных на базу из-за битой или чужой дельты
+    uint64_t delta_bytes = 0;       ///< байт дельт (входят в bytes_written)
+    uint64_t delta_image_bytes = 0; ///< сколько весили бы те же записи целиком
 };
 
 class ConversationDiskTier {
@@ -94,6 +113,9 @@ public:
     /// when it is still queued, else from the disk (waiting for its write when it is being written).  `admit(need,
     /// why)` is asked before each file's payload is allocated (session_file_read's RAM preflight).  `tokens` is what
     /// the request reuses (diagnostics).  On failure `out` is empty and `error` says why.
+    /// С цепочками запись, прочитанная с диска, остаётся там (встаёт последней в очередь вытеснения): она - база
+    /// дельты, когда беседа вернётся.  Битая дельта откатывает цепочку на базу: take() не удался, но следующий
+    /// best() найдёт базу.
     bool take(uint64_t id, int64_t tokens, SavedConversation& out, std::string& error,
               const std::function<bool(uint64_t need_bytes, std::string& why)>& admit = {});
 
@@ -112,7 +134,27 @@ public:
     /// The file name prefix of this tier (tests).
     static const char* file_prefix() { return "strata-conv-"; }
 
+    /// Подпись поля образа: длина и хеш каждого блока (delta_block_bytes).
+    struct FieldSig {
+        uint64_t len = 0;
+        std::vector<uint64_t> blocks;
+    };
+    using Table = std::map<uint64_t, FieldSig>;   ///< ключ поля (стадия, вид, номер) -> подпись
+    struct Prepared;                              ///< образ, разложенный на поля перед записью (conversation_disk.cpp)
+
 private:
+    // Цепочка записи: база (files[0, base_files) - сессионные файлы стадий) и дельты (остальные files, по порядку).
+    struct Chain {
+        size_t base_files = 0;
+        uint64_t base_bytes = 0;
+        bool known = false;                      ///< table описывает текущее состояние: можно писать дельту
+        uint64_t block = 0;                      ///< размер блока table
+        uint64_t digest = 0, base_digest = 0;    ///< отпечаток текущего состояния и базы (сцепка дельт)
+        std::shared_ptr<const Table> table;
+        ConversationCheckpoint base_live;        ///< ключи базы (есть дельты): на них откатывается цепочка
+        std::vector<ConversationCheckpoint> base_checkpoints;
+        std::string file;                        ///< persist: опись цепочки (.chn)
+    };
     struct Entry {
         uint64_t id = 0;
         std::vector<std::string> files;          ///< the first stage's image, then one per later stage
@@ -122,6 +164,8 @@ private:
         uint64_t bytes = 0;                      ///< the files' bytes (queued: the image's estimate)
         std::string index;                       ///< persist: the index file
         int64_t written_s = 0;                   ///< persist: when it was written (seconds since the epoch)
+        Chain chain;
+        size_t deltas() const { return files.size() - chain.base_files; }
     };
     struct Job {
         Entry entry;
@@ -129,11 +173,22 @@ private:
     };
     void writer();
     void write(Job& job);                                    // without the lock
+    bool write_full(Job& job, Prepared* prepared, uint64_t replace, bool compaction, const char* why);
+    bool write_delta(Job& job, Prepared& prepared, const Entry& target);
     void remove_locked(size_t index, bool delete_files);     // m_ held
+    void drop_file_locked(const std::string& path);         // m_ held: удалить сейчас или после чтения
+    size_t find_locked(uint64_t id) const;                   // m_ held: индекс записи или entries_.size()
+    bool cut_back_locked(const std::string& bad_delta, std::string& note);   // m_ held
+    size_t superseded_locked(const Entry& n, size_t stages) const;            // m_ held
+    bool read_chain(const Entry& want, SavedConversation& out, std::string& error,
+                    const std::function<bool(uint64_t, std::string&)>& admit, uint64_t& bytes, size_t& bad,
+                    bool& memory);
     void log(const std::string& line) const;
     SessionFileIdentity file_identity() const;
     bool write_index(Entry& e, std::string& error) const;
     bool read_index(const std::string& path, Entry& e) const;
+    bool write_chain_file(Entry& e, std::string& error) const;
+    bool read_chain_file(Entry& e) const;
     std::string scan_folder(size_t& stale, std::error_code& ec);   // open(): take in or remove; its log part
 
     ConversationDiskOptions options_;
@@ -143,6 +198,8 @@ private:
     std::condition_variable cv_;
     std::deque<Entry> entries_;   ///< on the disk, oldest first
     std::deque<Job> queue_;       ///< waiting for the writer, oldest first
+    std::multiset<std::string> reading_;   ///< файлы, которые сейчас читает take()
+    std::set<std::string> doomed_;         ///< удалить, когда их дочитают
     bool writing_ = false;        ///< the writer holds a job (writing_entry_ is its keys)
     Entry writing_entry_;
     bool stop_ = false;
